@@ -1,0 +1,59 @@
+#pragma kernel Sort
+
+struct ProjectileData
+{
+    float4x4 mat;
+    float3 velocity;
+
+    int casterId;
+    int valid;
+    float spawnTime;
+};
+
+RWStructuredBuffer<ProjectileData> data;
+RWStructuredBuffer<int> lastIndices;
+const uint numEntries;
+const uint groupWidth;
+const uint groupHeight;
+const uint stepIndex;
+
+const uint stageIndex;
+const uint numStages;
+
+// Sort the given entries by their keys (smallest to largest)
+// This is done using bitonic merge sort, and takes multiple iterations
+[numthreads(128, 1, 1)]
+void Sort (uint3 id : SV_DispatchThreadID)
+{
+	uint i = id.x;
+
+	uint hIndex = i & (groupWidth - 1);
+	uint indexLeft = hIndex + (groupHeight + 1) * (i / groupWidth);
+	uint rightStepSize = stepIndex == 0 ? groupHeight - 2 * hIndex : (groupHeight + 1) / 2;
+	uint indexRight = indexLeft + rightStepSize;
+
+	// Exit if out of bounds (for non-power of 2 input sizes)
+	if (indexRight >= numEntries) return;
+
+	int valueLeft = data[indexLeft].valid;
+	int valueRight = data[indexRight].valid;
+
+	if (valueLeft == 0 && valueRight == 1)
+	{
+		ProjectileData temp = data[indexLeft];
+		data[indexLeft] = data[indexRight];
+		data[indexRight] = temp;
+	}
+
+    if (stageIndex == numStages - 1 && stepIndex == stageIndex)
+    {
+        if (valueLeft == 1)
+        {
+            InterlockedMax(lastIndices[1], (int)indexLeft);
+        }
+        if (valueRight == 1)
+        {
+            InterlockedMax(lastIndices[1], (int)indexRight);
+        }
+    }
+}

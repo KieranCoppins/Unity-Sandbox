@@ -1,0 +1,298 @@
+#pragma kernel HandleShips
+#pragma kernel HandleProjectiles
+#pragma kernel UpdateSpatialHash
+
+#include "./SebastianLagueSpatialHash/SpatialHash.hlsl"
+
+static const int threadGroupSize = 256;
+
+struct SquadronMemberData
+{
+    float4x4 mat;
+    float3 velocity;
+    
+    int team;
+    int targetId;
+    int targetedByCount;
+
+    int dead;
+    float lastShotTime;
+
+    int id;
+};
+
+struct ProjectileData
+{
+    float4x4 mat;
+    float3 velocity;
+
+    int casterId;
+    int valid;
+    float spawnTime;
+};
+
+RWStructuredBuffer<SquadronMemberData> members;
+RWStructuredBuffer<ProjectileData> projectiles;
+// Where 0 is for members, and 1 is for projectiles
+RWStructuredBuffer<int> lastIndices;
+RWStructuredBuffer<uint3> SpatialIndices; // used for spatial hashing
+RWStructuredBuffer<uint> SpatialOffsets; // used for spatial hashing
+
+RWStructuredBuffer<uint> originalIndices;
+
+
+float enemyEvadeDistance;
+float collisionAvoidanceRadius;
+float bulletSpeed;
+uint squadronMembersCount;
+
+float targetDistanceWeight;
+float targetDotWeight;
+float targetSteerWeight;
+float collisionAvoidanceWeight;
+float enemyEvadeWeight;
+float boundsSteeringWeight;
+float deltaTime;
+float time;
+float minSpeed;
+float maxSpeed;
+float rotationSpeed;
+float projectileAliveTime;
+float shipRateOfFire;
+
+float3 GetPosition(float4x4 mat)
+{
+    return float3(mat[0][3], mat[1][3], mat[2][3]);
+}
+
+float3 GetDirection(float4x4 mat)
+{
+    return float3(mat[0][2], mat[1][2], mat[2][2]);
+}
+
+float3 SteerTowards(float3 vec, float3 vel, float ms, float rs)
+{
+    float3 v = -vel;
+    if (length(vec) != 0) {
+        v = (normalize(vec) * ms) - vel;
+    }
+    float magnitude = length(v);
+    if (magnitude > rs)
+    {
+        return (v / magnitude) * rs;
+    }
+    return v;
+}
+
+[numthreads(threadGroupSize, 1, 1)]
+void HandleShips (uint3 id : SV_DispatchThreadID)
+{
+    if (members[id.x].dead > 0) return;
+
+    float4x4 mat = members[id.x].mat;
+    float3 position = GetPosition(mat);
+    float3 direction = GetDirection(mat);
+
+    // Spatial
+    int3 cell = GetCell3D(position, enemyEvadeDistance / 2);
+
+    float bestScore = -99999;
+    float leastTargets = 10000;
+    float targetId = members[id.x].targetId;
+    int originalTargetId = 0;
+
+    float3 collisionAvoidance = float3(0,0,0);
+    float3 targetHeading = float3(0,0,0);
+    float3 enemyEvadeHeading = float3(0,0,0);
+
+    // If the target is dead
+    if (targetId != 0)
+    {
+        originalTargetId = originalIndices[targetId - 1];   
+        if (members[originalTargetId].dead > 0){
+            members[id.x].targetId = 0;
+            targetId = 0; 
+        }
+    }
+
+    for (int i = 0; i < 27; i++)
+    {
+		uint hash = HashCell3D(cell + offsets3D[i]);
+		uint key = KeyFromHash(hash, squadronMembersCount);
+		uint currIndex = SpatialOffsets[key];
+
+        while (currIndex < squadronMembersCount)
+        {   
+            uint3 indexData = SpatialIndices[currIndex];
+            currIndex ++;
+            // Exit if no longer looking at correct bin
+            if (indexData[2] != key) break;
+            // Skip if hash does not match
+            if (indexData[1] != hash) continue;
+
+            uint index = indexData[0];
+
+            // LOGIC
+            if (id.x != index)
+            {
+                SquadronMemberData other = members[index];
+                if (other.dead > 0) continue;
+                float3 otherPosition = GetPosition(other.mat);
+                float3 otherDirection = GetDirection(other.mat);
+
+                float3 offsetVector = otherPosition - position;
+                float sqrDst = offsetVector.x * offsetVector.x + offsetVector.y * offsetVector.y + offsetVector.z * offsetVector.z;
+                
+                // Calculate collision avoidance with other ships except our target
+                if (sqrDst < collisionAvoidanceRadius * collisionAvoidanceRadius)
+                {
+                    collisionAvoidance -= offsetVector / sqrDst;
+                }
+        
+                // Calculate enemy evade heading
+                if (other.targetId == members[id.x].id + 1 && sqrDst < enemyEvadeDistance * enemyEvadeDistance)
+                {
+                    // Calculate the cross product between the direction of the enemy and the direction of the ship
+                    enemyEvadeHeading += cross(otherDirection, direction);
+                }
+        
+                // Calculate target selection
+                if (members[id.x].targetId == 0 && other.team != members[id.x].team)
+                {
+                    float score = (sqrDst * -targetDistanceWeight) + (dot(normalize(direction), normalize(otherDirection)) * targetDotWeight);
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        targetId = other.id + 1;
+                    }
+                }
+            }
+        //END LOGIC
+        }
+    }
+    members[id.x].targetId = targetId;
+    if (targetId != 0)
+    {
+        originalTargetId = originalIndices[targetId - 1];
+        //InterlockedAdd(members[originalTargetId].targetedByCount, 1);
+
+        SquadronMemberData target = members[originalTargetId];
+
+        float3 targetPos = GetPosition(target.mat);
+        float3 offsetVector = targetPos - position;
+        float sqrDst = offsetVector.x * offsetVector.x + offsetVector.y * offsetVector.y + offsetVector.z * offsetVector.z;
+        float distance = sqrt(sqrDst);
+
+        // Using our targets position, the velocity they're moving and the velocity of our projectile, determine where they would be
+        float3 predictedPosition = targetPos + (target.velocity * (distance / bulletSpeed));
+        targetHeading = predictedPosition - position;
+    }
+
+    float3 acceleration = float3(0, 0, 0);
+    float3 velocity = members[id.x].velocity;
+
+    acceleration += SteerTowards(targetHeading, velocity, maxSpeed, rotationSpeed) * targetSteerWeight;
+    acceleration += SteerTowards(collisionAvoidance, velocity, maxSpeed, rotationSpeed) * collisionAvoidanceWeight;
+    acceleration += SteerTowards(enemyEvadeHeading, velocity, maxSpeed, rotationSpeed) * enemyEvadeWeight;
+    acceleration += SteerTowards(-position, velocity, maxSpeed, rotationSpeed) * boundsSteeringWeight;
+
+    velocity += acceleration * deltaTime;
+    float speed = length(velocity);
+    float3 dir = velocity / speed;
+    speed = clamp(speed, minSpeed, maxSpeed);
+    velocity = dir * speed;
+
+    position += velocity * deltaTime;
+    direction = normalize(dir);
+
+    members[id.x].velocity = velocity;
+
+    // Convert position and direction to matrix
+    float3 up = float3(0, 1, 0);
+    float3 right = normalize(cross(up, direction));
+    up = cross(direction, right);
+
+    mat = float4x4(
+        float4(right.x, up.x, direction.x, position.x),
+        float4(right.y, up.y, direction.y, position.y),
+        float4(right.z, up.z, direction.z, position.z),
+        float4(0, 0, 0, 1)
+    );
+
+    if (length(targetHeading) != 0 && time - members[id.x].lastShotTime > shipRateOfFire && dot(direction, normalize(targetHeading)) >= 0.99)
+    {
+        ProjectileData newProjectile;
+        newProjectile.valid = 1;
+        newProjectile.casterId = members[id.x].id + 1;
+        newProjectile.spawnTime = time;
+        newProjectile.mat = mat;
+        newProjectile.velocity = direction * bulletSpeed;
+        int index = 0;
+        InterlockedAdd(lastIndices[1], 1, index);
+        projectiles[index + 1] = newProjectile;
+        members[id.x].lastShotTime = time;
+    }
+
+    members[id.x].mat = mat;
+}
+
+
+
+[numthreads(threadGroupSize,1,1)]
+void HandleProjectiles(uint3 id: SV_DispatchThreadID)
+{
+    if (projectiles[id.x].valid == 0) return;
+
+    if (time - projectiles[id.x].spawnTime > projectileAliveTime)
+    {
+        projectiles[id.x].valid = 0;
+    } else {
+        float4x4 mat = projectiles[id.x].mat;
+        float3 position = GetPosition(mat);
+
+        int casterId = projectiles[id.x].casterId;
+        int originalIndex = originalIndices[casterId - 1];
+        int targetId = members[originalIndex].targetId;
+        int originalTargetId = originalIndices[targetId - 1];
+
+        float3 targetPosition = GetPosition(members[originalTargetId].mat);
+
+        // Check if the projectile's position is within hit distance to the target   
+        float3 offsetVector = targetPosition - position;
+        float sqrDst = offsetVector.x * offsetVector.x + offsetVector.y * offsetVector.y + offsetVector.z * offsetVector.z;
+        if (sqrDst <= 4)
+        {
+            // Destroy the enemy
+            projectiles[id.x].valid = 0;
+            InterlockedMin(members[originalIndex].targetId, 0);
+            InterlockedMax(members[originalTargetId].dead, 1);
+            return;
+        }
+
+        // Update our projectile's matrix position according to its velocity:
+        position += projectiles[id.x].velocity * deltaTime;
+        mat[0][3] = position.x;
+        mat[1][3] = position.y;
+        mat[2][3] = position.z;
+        projectiles[id.x].mat = mat;
+    }
+}
+
+
+// Spatial Stuffs
+[numthreads(threadGroupSize,1,1)]
+void UpdateSpatialHash (uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= squadronMembersCount) return;
+
+	// Reset offsets
+	SpatialOffsets[id.x] = squadronMembersCount;
+    
+	// Update index buffer
+	uint index = id.x;
+    float3 position = GetPosition(members[index].mat);
+	int3 cell = GetCell3D(position, enemyEvadeDistance / 2);
+	uint hash = HashCell3D(cell);
+	uint key = KeyFromHash(hash, squadronMembersCount);
+	SpatialIndices[id.x] = uint3(index, hash, key);
+}
