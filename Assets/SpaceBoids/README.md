@@ -15,3 +15,5 @@ Here is a diagram at how these systems work and communicate with eachother:
 I took a large chunk of inspiration (and some implementation) from [Sebastian Lague's github](https://github.com/SebLague) regarding the spatial partitioning using the bitonic merge sort in his [fluid simulation](https://github.com/SebLague/Fluid-Sim) and his investigation on [boids](https://github.com/SebLague/Boids) helped sparked the initial thoughts behind the first implementations of this.
 
 For the projectiles, I did originally explore using Unity's VFX systems or built-in particle systems. However for my usecase it became a large bottleneck having to read the buffers from the GPU to the CPU. Alternatively I devised my own solution, using compute shaders, to handle my projectiles.
+
+[Here](https://youtu.be/zsr6qhJ6VUA) is a very short video showcase of the space battle in action!
